@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+backend/venv/
+
+# Environment
+.env
+backend/.env
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# Runtime storage
+storage/audio/*
+storage/documents/*
+storage/exports/*
+storage/imports/*
+storage/temporary/*
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,322 @@
+﻿import re
+import unicodedata
+
+from collections import defaultdict
+
+from sqlalchemy.orm import Session
+
+from app.models import (
+    Answer,
+    BusinessRegister,
+    Conversation,
+    FormDefinition,
+    Question,
+    TaxAssessment,
+    Taxpayer,
+)
+
+
+POTENTIAL_NON_FILER_LABEL = (
+    "Potential non-filer — verification required"
+)
+
+
+def normalize_text(value):
+    if value is None:
+        return ""
+    value = unicodedata.normalize("NFKC", str(value)).casefold()
+    return re.sub(r"[^\w]+", " ", value).strip()
+
+
+def normalize_identifier(value):
+    if value is None:
+        return ""
+    return re.sub(r"[^a-z0-9]", "", str(value).casefold())
+
+
+def normalize_phone(value):
+    if value is None:
+        return ""
+    return re.sub(r"\D", "", str(value))
+
+
+def scalar_value(value):
+    """Return a simple scalar from a stored answer without exposing it."""
+    if isinstance(value, (str, int, float)):
+        return str(value).strip()
+    if isinstance(value, dict):
+        for key in ("value", "answer", "text"):
+            candidate = value.get(key)
+            if isinstance(candidate, (str, int, float)):
+                return str(candidate).strip()
+    return ""
+
+
+def build_reconciliation(db: Session, tax_year=None, limit=50, offset=0):
+    business_query = db.query(BusinessRegister).filter(
+        BusinessRegister.is_active.is_(True)
+    )
+
+    if tax_year is not None:
+        business_query = business_query.filter(
+            (BusinessRegister.tax_year == tax_year)
+            | (BusinessRegister.tax_year.is_(None))
+        )
+
+    total = business_query.count()
+    businesses = (
+        business_query
+        .order_by(BusinessRegister.business_name.asc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+
+    taxpayers = db.query(Taxpayer).filter(
+        Taxpayer.is_active.is_(True)
+    ).all()
+
+    # Read answers through the existing question/form relationships.
+    # Answer contents are used internally for matching and are never
+    # returned by this service.
+    answer_rows = (
+        db.query(
+            Answer,
+            Question.code,
+            FormDefinition.code.label("form_code"),
+            Conversation.taxpayer_id,
+            Conversation.status.label("conversation_status"),
+        )
+        .join(Question, Answer.question_id == Question.id)
+        .join(Conversation, Answer.conversation_id == Conversation.id)
+        .join(FormDefinition, Question.form_id == FormDefinition.id)
+        .filter(
+            Conversation.form_id == FormDefinition.id,
+            FormDefinition.code.in_(["FORM_A", "FORM_H1", "FORM_H3"]),
+        )
+        .all()
+    )
+
+    answers_by_taxpayer = defaultdict(list)
+    answer_counts = defaultdict(int)
+
+    for answer, question_code, form_code, taxpayer_id, status in answer_rows:
+        answers_by_taxpayer[taxpayer_id].append({
+            "form_code": form_code,
+            "question_code": question_code,
+            "value": scalar_value(answer.value_json),
+            "conversation_status": status,
+            "conversation_id": answer.conversation_id,
+        })
+        answer_counts[form_code] += 1
+
+    conversations = (
+        db.query(
+            Conversation.id,
+            Conversation.taxpayer_id,
+            Conversation.status,
+            FormDefinition.code.label("form_code"),
+        )
+        .join(FormDefinition, Conversation.form_id == FormDefinition.id)
+        .filter(FormDefinition.code.in_(["FORM_A", "FORM_H1", "FORM_H3"]))
+        .all()
+    )
+
+    conversations_by_taxpayer = defaultdict(list)
+    for conversation in conversations:
+        conversations_by_taxpayer[conversation.taxpayer_id].append({
+            "conversation_id": conversation.id,
+            "status": (conversation.status or "").upper(),
+            "form_code": conversation.form_code,
+        })
+
+    assessments = (
+        db.query(TaxAssessment).all()
+    )
+    assessments_by_taxpayer = defaultdict(list)
+    for assessment in assessments:
+        assessments_by_taxpayer[assessment.taxpayer_id].append(
+            assessment
+        )
+
+    # Form A tax identifiers can be compared with the register's
+    # tax_identifier because Taxpayer does not have a direct tax-ID
+    # column in the current model.
+    tax_ids_by_taxpayer = defaultdict(set)
+    for taxpayer_id, records in answers_by_taxpayer.items():
+        for record in records:
+            if (
+                record["form_code"] == "FORM_A"
+                and record["question_code"] == "A_TAX_ID"
+            ):
+                normalized = normalize_identifier(record["value"])
+                if normalized:
+                    tax_ids_by_taxpayer[taxpayer_id].add(normalized)
+
+    results = []
+
+    h1_h3_available = (
+        answer_counts["FORM_H1"] > 0
+        or answer_counts["FORM_H3"] > 0
+    )
+
+    for business in businesses:
+        business_tax_id = normalize_identifier(business.tax_identifier)
+        business_phone = normalize_phone(business.phone_number)
+        business_email = (business.email or "").strip().casefold()
+        business_name = normalize_text(
+            business.normalized_name or business.business_name
+        )
+        business_city = normalize_text(business.city)
+
+        candidates = []
+
+        for taxpayer in taxpayers:
+            reasons = []
+            score = 0
+
+            if (
+                business_tax_id
+                and business_tax_id in tax_ids_by_taxpayer.get(
+                    taxpayer.id, set()
+                )
+            ):
+                score = 100
+                reasons.append("Exact tax identifier match to saved Form A answer")
+
+            taxpayer_phones = {
+                normalize_phone(taxpayer.phone_number),
+                normalize_phone(taxpayer.whatsapp_number),
+            } - {""}
+            taxpayer_email = (taxpayer.email or "").strip().casefold()
+
+            if business_phone and business_phone in taxpayer_phones:
+                score = max(score, 65)
+                reasons.append("Phone number match")
+
+            if business_email and taxpayer_email:
+                if business_email == taxpayer_email:
+                    score = max(score, 65)
+                    reasons.append("Email match")
+
+            taxpayer_name = normalize_text(taxpayer.full_name)
+            if business_name and taxpayer_name and business_name == taxpayer_name:
+                score = max(score, 35)
+                reasons.append("Name-only match; weak evidence")
+
+                if (
+                    business_city
+                    and normalize_text(taxpayer.city) == business_city
+                ):
+                    score = min(45, score + 10)
+                    reasons.append("City also matches")
+
+            if score:
+                candidates.append({
+                    "taxpayer_id": taxpayer.id,
+                    "taxpayer_reference": taxpayer.taxpayer_reference,
+                    "confidence_score": score,
+                    "reasons": reasons,
+                    "review_required": score < 80,
+                })
+
+        candidates.sort(
+            key=lambda item: (
+                item["confidence_score"],
+                len(item["reasons"]),
+            ),
+            reverse=True,
+        )
+        candidates = candidates[:5]
+
+        target_year = business.tax_year if business.tax_year is not None else tax_year
+
+        # A completed conversation is interaction evidence, not by itself
+        # a definitive confirmation that a legally valid return was filed.
+        completed_form_a = []
+        assessment_evidence = []
+        for candidate in candidates:
+            taxpayer_id = candidate["taxpayer_id"]
+
+            for conversation in conversations_by_taxpayer.get(taxpayer_id, []):
+                if (
+                    conversation["form_code"] == "FORM_A"
+                    and conversation["status"] == "COMPLETED"
+                ):
+                    completed_form_a.append({
+                        "taxpayer_id": taxpayer_id,
+                        "conversation_id": conversation["conversation_id"],
+                        "evidence_type": "Completed Form A conversation",
+                        "confirmation": "Requires filing-record verification",
+                    })
+
+            for assessment in assessments_by_taxpayer.get(taxpayer_id, []):
+                if target_year is not None and assessment.tax_year != target_year:
+                    continue
+                assessment_evidence.append({
+                    "taxpayer_id": taxpayer_id,
+                    "assessment_id": assessment.id,
+                    "form_code": assessment.form_code,
+                    "tax_year": assessment.tax_year,
+                    "calculation_status": assessment.calculation_status,
+                    "evidence_type": "Assessment record only; not proof of filing",
+                })
+
+        # Employer-return evidence is not inferred from taxpayer assessments.
+        # This check looks for saved H1/H3 answers associated with employer
+        # forms. The actual answer values are not returned.
+
+        filing_evidence_found = bool(completed_form_a)
+        if not filing_evidence_found:
+            filing_label = POTENTIAL_NON_FILER_LABEL
+        else:
+            filing_label = "Filing interaction evidence found — verification required"
+
+        results.append({
+            "business": {
+                "id": business.id,
+                "business_name": business.business_name,
+                "registration_number": business.registration_number,
+                "tax_year": business.tax_year,
+                "city": business.city,
+                "source_name": business.source_name,
+                "source_url": business.source_url,
+            },
+            "requested_tax_year": target_year,
+            "candidate_matches": candidates,
+            "filing_review": {
+                "status_label": filing_label,
+                "completed_form_a_interactions": completed_form_a,
+                "assessment_records": assessment_evidence,
+                "h1_h3_evidence_status": (
+                    "Saved H1/H3 answers exist; employer matching needs review"
+                    if h1_h3_available
+                    else "Unavailable: no saved H1/H3 answers were found"
+                ),
+                "verification_required": True,
+                "notice": (
+                    "This is a screening result, not a finding of tax "
+                    "noncompliance. Verify official filing records before "
+                    "drawing conclusions."
+                ),
+            },
+            "review_required": (
+                not candidates
+                or any(item["review_required"] for item in candidates)
+                or not filing_evidence_found
+            ),
+        })
+
+    return {
+        "total_businesses": total,
+        "limit": limit,
+        "offset": offset,
+        "tax_year_filter": tax_year,
+        "read_only": True,
+        "h1_h3_answer_count": (
+            answer_counts["FORM_H1"] + answer_counts["FORM_H3"]
+        ),
+        "h1_h3_evidence_available": h1_h3_available,
+        "items": results,
+    }
+
